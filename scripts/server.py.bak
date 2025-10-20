@@ -1,0 +1,145 @@
+# scripts/server.py
+# Schrijft veilig naar scripts/tcp_log.txt en naar web/data.json.
+import socket, json, time, re, os, traceback
+from pathlib import Path
+
+HOST = "0.0.0.0"
+PORT = 8010
+
+BASE = Path(__file__).parent
+LOG = BASE / "tcp_log.txt"
+DATA_FILE = BASE.parent / "web" / "data.json"
+FLASK_FORWARD = os.environ.get("FLASK_FORWARD")  # optional: http://127.0.0.1:8080/update
+TRACKER_SECRET = os.environ.get("TRACKER_SECRET")  # optional for forwarding
+
+def safe_append_log(line: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    LINE = f"[{ts}] {line}\n"
+    # print to stdout for immediate feedback
+    print(LINE, end="")
+    try:
+        # append mode is safer / atomic-ish vs reading whole file (OneDrive issues)
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(LINE)
+    except Exception as e:
+        print(f"[LOG ERROR] {e}")
+
+def write_data(d):
+    try:
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DATA_FILE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        safe_append_log("wrote to web/data.json")
+    except Exception as e:
+        safe_append_log(f"write_data error: {e}")
+
+def try_parse_coords(txt):
+    txt = txt.strip()
+    # 1) JSON with lat/lon
+    try:
+        j = json.loads(txt)
+        if isinstance(j, dict):
+            if "lat" in j and "lon" in j:
+                out = {"lat": float(j["lat"]), "lon": float(j["lon"])}
+                if "speed" in j: out["speed"] = j.get("speed")
+                return out
+    except Exception:
+        pass
+
+    # 2) simple decimal pair
+    m = re.search(r"(-?\d+\.\d+)[,;\s]+(-?\d+\.\d+)", txt)
+    if m:
+        return {"lat": float(m.group(1)), "lon": float(m.group(2))}
+
+    # 3) imei/gps103 style payloads (try to catch DMM formats)
+    if "imei" in txt.lower():
+        # try to extract decimals first
+        m2 = re.search(r"(-?\d+\.\d+)[,;\s]+(-?\d+\.\d+)", txt)
+        if m2:
+            return {"lat": float(m2.group(1)), "lon": float(m2.group(2))}
+        # DDDMM.MMMM patterns like 3751.65,N,12258.12,W
+        dmm = re.search(r"(\d{4,7}\.\d+),([NS]),(\d{5,7}\.\d+),([EW])", txt)
+        if dmm:
+            def dmm_to_dec(s, hemi):
+                s = float(s)
+                deg = int(s // 100)
+                minutes = s - deg*100
+                dec = deg + minutes/60.0
+                if hemi in ("S","W"):
+                    dec = -dec
+                return dec
+            lat = dmm_to_dec(dmm.group(1), dmm.group(2))
+            lon = dmm_to_dec(dmm.group(3), dmm.group(4))
+            return {"lat": lat, "lon": lon}
+
+    # 4) fallback: first two decimals found
+    all_dec = re.findall(r"-?\d+\.\d+", txt)
+    if len(all_dec) >= 2:
+        return {"lat": float(all_dec[0]), "lon": float(all_dec[1])}
+
+    return None
+
+def forward_to_flask(parsed):
+    if not FLASK_FORWARD:
+        return
+    try:
+        import requests
+        headers = {"Content-Type":"application/json"}
+        if TRACKER_SECRET:
+            headers["X-Tracker-Secret"] = TRACKER_SECRET
+        r = requests.post(FLASK_FORWARD, json=parsed, headers=headers, timeout=5)
+        safe_append_log(f"forwarded to {FLASK_FORWARD}: {r.status_code}")
+    except Exception as e:
+        safe_append_log(f"forward failed: {e}")
+
+def serve():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen(5)
+        safe_append_log(f"TCP server listening on {HOST}:{PORT}")
+        while True:
+            try:
+                conn, addr = s.accept()
+                with conn:
+                    client = f"{addr[0]}:{addr[1]}"
+                    safe_append_log(f"connected: {client}")
+                    conn.settimeout(3.0)
+                    chunks = []
+                    try:
+                        while True:
+                            data = conn.recv(4096)
+                            if not data:
+                                break
+                            chunks.append(data)
+                    except socket.timeout:
+                        pass
+                    raw = b"".join(chunks)
+                    try:
+                        txt = raw.decode('utf-8', errors='replace').strip()
+                    except Exception:
+                        txt = str(raw)
+                    safe_append_log(f"raw from {client}: {txt[:1500]!r}")
+
+                    parsed = None
+                    try:
+                        parsed = try_parse_coords(txt)
+                        if parsed:
+                            # add metadata
+                            parsed.setdefault("source", addr[0])
+                            parsed.setdefault("raw", txt)
+                            parsed.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S"))
+                            write_data(parsed)
+                            forward_to_flask(parsed)
+                        else:
+                            safe_append_log("no JSON/coords parsed")
+                    except Exception as e:
+                        safe_append_log("parse error: " + repr(e))
+                        safe_append_log(traceback.format_exc())
+
+                    safe_append_log(f"connection closed: {client}")
+            except Exception as e:
+                safe_append_log("accept/loop error: " + repr(e))
+                safe_append_log(traceback.format_exc())
+
+if __name__ == "__main__":
+    serve()

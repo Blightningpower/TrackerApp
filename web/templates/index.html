@@ -1,0 +1,28 @@
+<!-- web/templates/index.html -->
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tracker Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+  <div class="container">
+    <h1>Tracker Dashboard</h1>
+    <div id="info">
+      <p><strong>Lat:</strong> <span id="lat">—</span></p>
+      <p><strong>Lon:</strong> <span id="lon">—</span></p>
+      <p><strong>Speed:</strong> <span id="speed">—</span></p>
+      <p><strong>Device time:</strong> <span id="devtime">—</span></p>
+      <p><strong>Last update (server):</strong> <span id="svr">—</span></p>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+
+</html>
