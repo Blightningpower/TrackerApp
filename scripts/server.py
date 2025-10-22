@@ -1,61 +1,15 @@
 # scripts/server.py
-"""
-TCP trapserver voor jouw tracker:
-- luistert op HOST:PORT
-- slaat geparste locatie (lat/lon/speed/timestamp) op in ../web/data.json
-- optioneel forward naar FLASK_FORWARD (env) met X-Tracker-Secret header (TRACKER_SECRET env)
-- logt gebeurtenissen naar scripts/tcp_log.txt
-Geschikt als basis; ondersteunt standaard JT808 0x0200 location parsing (niet alle vendor-varianten).
-"""
+import socket, json, time, re, os
 from pathlib import Path
-import socket
-import json
-import time
-import re
-import os
 import struct
-from typing import Optional, Dict, Any, List
+from datetime import datetime
 
-HOST = "0.0.0.0"
-PORT = 8010
-
-BASE = Path(__file__).parent
-LOG = BASE / "tcp_log.txt"
-DATA_FILE = BASE.parent / "web" / "data.json"  # ../web/data.json
-FLASK_FORWARD = os.environ.get("FLASK_FORWARD")  # voorbeeld: "http://127.0.0.1:8080/update"
-TRACKER_SECRET = os.environ.get("TRACKER_SECRET")  # optioneel, gebruikt bij forward
-
-# --- utilities -------------------------------------------------------------
-
-def log(msg: str) -> None:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    try:
-        txt = LOG.read_text(encoding="utf-8") if LOG.exists() else ""
-        LOG.write_text(txt + line + "\n", encoding="utf-8")
-    except Exception:
-        # laat falen geen crash veroorzaken
-        pass
-
-def safe_write_json(path: Path, obj: Dict[str, Any]) -> bool:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-        return True
-    except Exception as e:
-        log(f"write error: {e}")
-        return False
-
-# --- JT808 parsing helpers -------------------------------------------------
-
-def unescape_jt(b: bytes) -> bytes:
-    # JT808 escape rules: 0x7d 0x01 -> 0x7d, 0x7d 0x02 -> 0x7e
-    # apply sequential replace
-    return b.replace(b'\x7d\x01', b'\x7d').replace(b'\x7d\x02', b'\x7e')
+def unescape_jt(data: bytes) -> bytes:
+    # JT808 escape: 7D 01 -> 7D, 7D 02 -> 7E
+    return data.replace(b'\x7d\x01', b'\x7d').replace(b'\x7d\x02', b'\x7e')
 
 def xor_checksum_ok(frame_no_delims: bytes) -> bool:
-    # frame_no_delims: bytes between delimiters, last byte is checksum
+    # frame_no_delims includes everything except leading/trailing 0x7e and includes checksum as last byte
     if len(frame_no_delims) < 2:
         return False
     body = frame_no_delims[:-1]
@@ -66,87 +20,81 @@ def xor_checksum_ok(frame_no_delims: bytes) -> bool:
     return cs == chksum
 
 def bcd6_to_timestr(b: bytes) -> str:
-    # 6 BCD bytes in JT808 are YY MM DD hh mm ss (each byte = two BCD digits)
+    # 6 bytes BCD -> 'YYYY-MM-DD HH:MM:SS' (spec has YYMMDDhhmmss)
+    # many JT808 timestamps are YYMMDDhhmmss -> assume 20YY
     if len(b) != 6:
         return ""
+    y = 2000 + int(f"{b[0]:02x}")  # careful: b[i] are bytes, but converting to hex gives e.g. 0x20 -> '20'
+    # safer to convert each nibble decimal via format:
     digits = []
     for byte in b:
-        hi = (byte >> 4) & 0xF
-        lo = byte & 0xF
-        digits.append(str(hi))
-        digits.append(str(lo))
+        digits.append(f"{byte:02x}")
+    # digits = ['yy','mm','dd','hh','mm','ss']
     try:
-        yy = int(digits[0] + digits[1])
-        mm = int(digits[2] + digits[3])
-        dd = int(digits[4] + digits[5])
-        hh = int(digits[6] + digits[7])
-        mi = int(digits[8] + digits[9])
-        ss = int(digits[10] + digits[11])
-        year = 2000 + yy
-        return f"{year:04d}-{mm:02d}-{dd:02d} {hh:02d}:{mi:02d}:{ss:02d}"
+        yy = int(digits[0])
+        mm = int(digits[1])
+        dd = int(digits[2])
+        hh = int(digits[3])
+        mi = int(digits[4])
+        ss = int(digits[5])
+        return f"{2000+yy:04d}-{mm:02d}-{dd:02d} {hh:02d}:{mi:02d}:{ss:02d}"
     except Exception:
         return ""
 
-def parse_jt808(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
+def parse_jt808(raw_bytes: bytes):
     """
-    Parse JT808 frames in raw_bytes and return first found location dict or None.
-    Supports:
-      - frame delimiters 0x7E
-      - escaping 0x7D 0x01 / 0x7D 0x02
-      - checksum verify (XOR)
-      - 0x0200 location message parsing (alarm,status,lat,lon,alt,speed,dir,time)
-    Returns dict like: {protocol:"jt808", lat:..., lon:..., speed:..., timestamp:..., raw: ...}
+    Try to parse JT808 frames in raw_bytes.
+    Returns a dict with lat/lon/speed/timestamp if a 0x0200 location is found,
+    or None if not parsed.
     """
+    results = []
+    # split on 0x7e (frame delimiter). keep bytes between delimiters
     parts = raw_bytes.split(b'\x7e')
     for p in parts:
         if not p:
             continue
+        # p may contain the frame bytes including checksum
         unescaped = unescape_jt(p)
-        # need at least msg header + checksum
+        # require at least header+checksum
         if len(unescaped) < 5:
             continue
-        # verify checksum
         if not xor_checksum_ok(unescaped):
-            # skip invalid frames
+            # optionally skip or still try
             continue
-        payload_with_checksum = unescaped
-        payload = payload_with_checksum[:-1]  # without checksum
+        # payload without checksum:
+        payload = unescaped[:-1]
         if len(payload) < 12:
             continue
-        # parse header
+        # header parsing
         msg_id = int.from_bytes(payload[0:2], 'big')
         msg_props = int.from_bytes(payload[2:4], 'big')
-        # body length (low 10 bits)
-        body_len = msg_props & 0x03FF
-        # check subpackage flag (bit 13) -> if set, there's extra 4 bytes in header for package info
-        subpackage_flag = bool(msg_props & 0x2000)
-        # header base length: msgid(2)+props(2)+terminal(6)+serial(2) = 12
+        body_len = msg_props & 0x03FF  # low 10 bits
+        # header length normally: 2(msgid)+2(props)+6(terminal)+2(serial) = 12
         header_len = 12
-        if subpackage_flag:
-            header_len += 4  # package info: total packages + package seq
         if len(payload) < header_len + body_len:
-            # frame incomplete (shouldn't happen if checksum ok) -> skip
             continue
-        body = payload[header_len:header_len + body_len]
-        # handle location message
+        body = payload[header_len:header_len+body_len]
+        # 0x0200 is location report
         if msg_id == 0x0200:
-            # expect at least 4+4+4+4+2+2+2+6 = 28 bytes
-            if len(body) < 28:
+            # body layout (standard): alarm(4), status(4), lat(4), lon(4),
+            # altitude(2), speed(2), direction(2), time(6)
+            if len(body) < 4+4+4+4+2+2+2+6:
                 continue
             alarm = int.from_bytes(body[0:4], 'big')
             status = int.from_bytes(body[4:8], 'big')
             lat_raw = int.from_bytes(body[8:12], 'big', signed=False)
             lon_raw = int.from_bytes(body[12:16], 'big', signed=False)
-            alt = int.from_bytes(body[16:18], 'big', signed=False)
-            speed_raw = int.from_bytes(body[18:20], 'big', signed=False)
-            direction = int.from_bytes(body[20:22], 'big', signed=False)
+            alt = int.from_bytes(body[16:18], 'big')
+            speed_raw = int.from_bytes(body[18:20], 'big')
+            direction = int.from_bytes(body[20:22], 'big')
             time_bcd = body[22:28]
+            # convert lat/lon: spec stores degrees * 1e6
             lat = lat_raw / 1e6
             lon = lon_raw / 1e6
-            # commonly speed is in 1/10 km/h, convert to km/h as heuristic
-            speed_kmh = round(speed_raw / 10.0, 1)
+            # speed unit: device dependent (often 1/10 km/h or km/h) -> leave raw for now
+            # timestamp from device:
             devtime = bcd6_to_timestr(time_bcd)
-            return {
+            results.append({
                 "protocol": "jt808",
                 "msg_id": hex(msg_id),
                 "alarm": alarm,
@@ -155,122 +103,91 @@ def parse_jt808(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
                 "lon": lon,
                 "alt": alt,
                 "speed_raw": speed_raw,
-                "speed_kmh": speed_kmh,
                 "direction": direction,
-                "timestamp": devtime,
-                "raw_preview": raw_bytes[:200].hex()
-            }
-    return None
+                "timestamp": devtime
+            })
+    # return first found (or list if you prefer)
+    return results[0] if results else None
 
-# --- fallback simple ASCII coords parser ----------------------------------
+HOST = "0.0.0.0"
+PORT = 8010
+LOG = Path(__file__).parent / "tcp_log.txt"
+DATA_FILE = Path(__file__).parent.parent / "web" / "data.json"
+FLASK_FORWARD = os.environ.get("FLASK_FORWARD")  # e.g. "http://127.0.0.1:8080/update"
+TRACKER_SECRET = os.environ.get("TRACKER_SECRET")
 
-def try_parse_coords_ascii(txt: str) -> Optional[Dict[str, Any]]:
-    """
-    Probeer eenvoudige ASCII "lat lon" of "lat,lon" of JSON in tekst te parsen.
-    Retourneert dict of None.
-    """
-    # JSON first
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    LINE = f"[{ts}] {msg}\n"
+    print(LINE, end="")
     try:
-        j = json.loads(txt)
-        if isinstance(j, dict) and "lat" in j and "lon" in j:
-            return j
+        LOG.write_text(LOG.read_text(encoding="utf-8") + LINE if LOG.exists() else LINE, encoding="utf-8")
     except Exception:
         pass
-    # zoek decimal coords
+
+def write_data(d):
+    try:
+        DATA_FILE.write_text(json.dumps(d), encoding="utf-8")
+    except Exception as e:
+        log(f"write error: {e}")
+
+def try_parse_coords(txt):
     m = re.search(r"(-?\d+\.\d+)[,;\s]+(-?\d+\.\d+)", txt)
     if m:
-        try:
-            return {"lat": float(m.group(1)), "lon": float(m.group(2))}
-        except Exception:
-            return None
+        return {"lat": float(m.group(1)), "lon": float(m.group(2))}
     return None
 
-# --- main server loop -----------------------------------------------------
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind((HOST, PORT))
+    s.listen(5)
+    log(f"TCP server listening on {HOST}:{PORT}")
+    while True:
+        conn, addr = s.accept()
+        with conn:
+            client = f"{addr[0]}:{addr[1]}"
+            log(f"connected: {client}")
+            conn.settimeout(5.0)
+            chunks = []
+            try:
+                while True:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            except socket.timeout:
+                pass
+            raw = b"".join(chunks)
+            try:
+                txt = raw.decode('utf-8', errors='replace').strip()
+            except Exception:
+                txt = str(raw)
+            log(f"raw from {client}: {txt[:1000]!r}")
 
-def forward_to_flask(parsed: Dict[str, Any]) -> None:
-    if not FLASK_FORWARD:
-        return
-    try:
-        import requests
-        headers = {"Content-Type": "application/json"}
-        if TRACKER_SECRET:
-            headers["X-Tracker-Secret"] = TRACKER_SECRET
-        r = requests.post(FLASK_FORWARD, json=parsed, headers=headers, timeout=5)
-        log(f"forwarded to {FLASK_FORWARD}: {r.status_code}")
-    except Exception as e:
-        log(f"forward failed: {e}")
-
-def write_found(parsed: Dict[str, Any]) -> None:
-    # voeg server timestamp toe
-    parsed_copy = dict(parsed)
-    parsed_copy["server_ts"] = int(time.time())
-    safe_write_json(DATA_FILE, parsed_copy)
-    log(f"wrote to {DATA_FILE} -> {json.dumps(parsed_copy, ensure_ascii=False)[:400]}")
-
-def run_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, PORT))
-        s.listen(5)
-        log(f"TCP server listening on {HOST}:{PORT}")
-        while True:
-            conn, addr = s.accept()
-            with conn:
-                client = f"{addr[0]}:{addr[1]}"
-                log(f"connected: {client}")
-                conn.settimeout(5.0)
-                chunks: List[bytes] = []
-                try:
-                    while True:
-                        data = conn.recv(4096)
-                        if not data:
-                            break
-                        chunks.append(data)
-                except socket.timeout:
-                    # client stopte met sturen
-                    pass
-                raw = b"".join(chunks)
-                try:
-                    txt = raw.decode('utf-8', errors='replace').strip()
-                except Exception:
-                    txt = ""
-                preview = raw[:1000] if len(raw) > 0 else txt
-                log(f"raw from {client}: {preview!r}")
-
-                parsed = None
-                # 1) probeer ASCII/JSON parse
-                if txt:
-                    parsed = try_parse_coords_ascii(txt)
-
-                # 2) als nog niks, probeer JT808 binaire parse op raw bytes
-                if parsed is None and raw:
-                    try:
-                        jt = parse_jt808(raw)
-                        if jt:
-                            parsed = jt
-                    except Exception as e:
-                        log(f"jt parse error: {e}")
-
-                if isinstance(parsed, dict):
-                    try:
-                        write_found(parsed)
-                    except Exception as e:
-                        log(f"write_found error: {e}")
-                    # optional forward
-                    if FLASK_FORWARD:
-                        try:
-                            forward_to_flask(parsed)
-                        except Exception as e:
-                            log(f"forward exception: {e}")
+            parsed = None
+            try:
+                parsed = json.loads(txt)
+                log(f"parsed JSON from {client}: {parsed}")
+            except Exception:
+                coords = try_parse_coords(txt)
+                if coords:
+                    parsed = coords
+                    log(f"parsed coords from {client}: {parsed}")
                 else:
                     log("no JSON/coords parsed")
 
-                log(f"connection closed: {client}")
+            if isinstance(parsed, dict):
+                write_data(parsed)
+                log("wrote to data.json")
 
-if __name__ == "__main__":
-    try:
-        run_server()
-    except KeyboardInterrupt:
-        log("shutting down (KeyboardInterrupt)")
-    except Exception as exc:
-        log(f"fatal server error: {exc}")
+                if FLASK_FORWARD:
+                    try:
+                        import requests
+                        headers = {"Content-Type":"application/json"}
+                        if TRACKER_SECRET:
+                            headers["X-Tracker-Secret"] = TRACKER_SECRET
+                        r = requests.post(FLASK_FORWARD, json=parsed, headers=headers, timeout=5)
+                        log(f"forwarded to {FLASK_FORWARD}: {r.status_code}")
+                    except Exception as e:
+                        log(f"forward failed: {e}")
+
+            log(f"connection closed: {client}")

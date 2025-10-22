@@ -1,0 +1,194 @@
+/* =========  BASICS  ========= */
+:root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #0b1220;
+    --muted: #6b7280;
+    --border: #e6e8ec;
+    --accent: #2563eb;
+    /* blauw */
+    --accent-ink: #ffffff;
+    --btn-bg: #fafafa;
+    --btn-border: #e5e7eb;
+    --btn-bg-hover: #f0f2f5;
+    --shadow: 0 6px 20px rgba(15, 23, 42, .06);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0b1220;
+        --card: #0f1629;
+        --ink: #e5e7eb;
+        --muted: #9aa3b2;
+        --border: #1d2437;
+        --btn-bg: #141b2e;
+        --btn-border: #212a41;
+        --btn-bg-hover: #18223a;
+        --shadow: 0 6px 24px rgba(0, 0, 0, .35);
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* =========  LAYOUT  ========= */
+.container {
+    max-width: 980px;
+    margin: clamp(16px, 4vw, 40px) auto;
+    background: var(--card);
+    padding: clamp(14px, 3vw, 22px);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--border);
+}
+
+h1 {
+    margin: 0 0 14px;
+    font-weight: 700;
+    letter-spacing: .2px;
+    font-size: clamp(22px, 2.6vw, 30px);
+}
+
+/* Kaart: responsief hoger op mobiel */
+#map {
+    height: clamp(420px, 58vh, 560px);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+}
+
+/* rijen met controls */
+.row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin: 12px 0;
+    flex-wrap: wrap;
+}
+
+/* meta-info onderaan */
+.meta {
+    font-size: 14px;
+    margin-top: 10px;
+    line-height: 1.6;
+}
+
+.meta b {
+    display: inline-block;
+    min-width: 170px;
+    color: var(--muted);
+}
+
+/* =========  CONTROLS  ========= */
+button,
+a.btn {
+    appearance: none;
+    padding: 8px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--btn-border);
+    background: var(--btn-bg);
+    color: var(--ink);
+    text-decoration: none;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease, transform .02s ease-in;
+    line-height: 1.2;
+}
+
+button:hover,
+a.btn:hover {
+    background: var(--btn-bg-hover);
+}
+
+button:active,
+a.btn:active {
+    transform: translateY(1px);
+}
+
+button:disabled,
+a.btn[aria-disabled="true"] {
+    opacity: .55;
+    cursor: not-allowed;
+}
+
+/* “primaire” stijl (kun je toevoegen door class="btn btn--primary") */
+.btn--primary {
+    background: var(--accent);
+    border-color: color-mix(in oklab, var(--accent), black 8%);
+    color: var(--accent-ink);
+}
+
+.btn--primary:hover {
+    background: color-mix(in oklab, var(--accent), white 8%);
+}
+
+/* select + checkbox netjes */
+select {
+    padding: 7px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--btn-border);
+    background: var(--btn-bg);
+    color: var(--ink);
+}
+
+label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+}
+
+/* hints / kleine tekst */
+.hint {
+    color: var(--muted);
+    font-size: 12px;
+    margin-left: 6px;
+}
+
+/* link-states consistent */
+a {
+    color: var(--accent);
+}
+
+a:focus-visible,
+button:focus-visible,
+select:focus-visible {
+    outline: 3px solid color-mix(in oklab, var(--accent), white 25%);
+    outline-offset: 2px;
+    border-color: var(--accent);
+}
+
+/* Leaflet attribution subtiel */
+.leaflet-control-attribution {
+    background: color-mix(in oklab, var(--card), transparent 40%);
+    border-radius: 8px;
+    padding: 2px 6px !important;
+    color: var(--muted);
+}
+
+/* kleine schermen */
+@media (max-width: 520px) {
+    .meta b {
+        min-width: 130px;
+    }
+}
